@@ -158,6 +158,46 @@ function _readFC16(data, next) {
         next(null, { "address": dataAddress, "length": length });
 }
 
+
+/**
+ * Parse the data for a Modbus -
+ * Read Device Identification (FC=43)
+ *
+ * @param {Buffer} data the data buffer to parse.
+ * @param {Modbus} modbus the client in case we need to read more device information
+ * @param {Function} next the function to call next.
+ */
+function _readFC43(data, modbus, next) {
+    var address = parseInt(data.readUInt8(0));
+    var readDeviceIdCode = parseInt(data.readUInt8(3));
+    var conformityLevel = parseInt(data.readUInt8(4));
+    var moreFollows = parseInt(data.readUInt8(5));
+    var nextObjectId = parseInt(data.readUInt8(6));
+    var numOfObjects = parseInt(data.readUInt8(7));
+
+    var startAt = 8;
+    var result = {};
+    for (var i = 0; i < numOfObjects; i++) {
+        var objectId = parseInt(data.readUInt8(startAt));
+        var objectLength = parseInt(data.readUInt8(startAt + 1));
+        const startOfData = startAt + 2;
+        result[objectId] = data.toString("ascii", startOfData, startOfData + objectLength);
+        startAt = startOfData + objectLength;
+    }
+
+    // is it saying to follow and did you previously get data
+    // if you did not previously get data go ahead and halt to prevent an infinite loop
+    if (moreFollows && numOfObjects) {
+        const cb = function(err, data) {
+            data.data = Object.assign(data.data, result);
+            return next(err, data);
+        };
+        modbus.writeFC43(address, readDeviceIdCode, nextObjectId, cb);
+    } else if (next) {
+        next(null, { data: result, conformityLevel });
+    }
+}
+
 /**
  * Wrapper method for writing to a port with timeout. <code><b>[this]</b></code> has the context of ModbusRTU
  * @param {Buffer} buffer The data to send
@@ -266,7 +306,7 @@ ModbusRTU.prototype.open = function(callback) {
 
                 /* check minimal length
                  */
-                if (data.length < 5) {
+                if (!transaction.lengthUnknown && data.length < 5) {
                     error = "Data length error, expected " +
                         transaction.nextLength + " got " + data.length;
                     if (transaction.next)
@@ -306,7 +346,7 @@ ModbusRTU.prototype.open = function(callback) {
                  * if we do not expect this data
                  * raise an error
                  */
-                if (data.length !== transaction.nextLength) {
+                if (!transaction.lengthUnknown && data.length !== transaction.nextLength) {
                     error = "Data length error, expected " +
                         transaction.nextLength + " got " + data.length;
                     if (transaction.next)
@@ -356,6 +396,9 @@ ModbusRTU.prototype.open = function(callback) {
                         // Preset Multiple Registers
                         _readFC16(data, transaction.next);
                         break;
+                    case 43:
+                        // read device identification
+                        _readFC43(data, modbus, transaction.next);
                 }
             });
 
@@ -760,6 +803,43 @@ ModbusRTU.prototype.writeFC16 = function(address, dataAddress, array, next) {
     _writeBufferToPort.call(this, buf, this._port._transactionIdWrite);
 };
 
+/**
+ * Write a Modbus "Read Device Identification" (FC=43) to serial port.
+ *
+ * @param {number} address the slave unit address.
+ * @param {number} deviceIdCode the read device access code.
+ * @param {number} objectId the array of values to write to registers.
+ * @param {Function} next the function to call next.
+ */
+ModbusRTU.prototype.writeFC43 = function(address, deviceIdCode, objectId, next) {
+    // check port is actually open before attempting write
+    if (this.isOpen !== true) {
+        if (next) next(new PortNotOpenError());
+        return;
+    }
+
+    var code = 0x2B; // 43
+
+    // set state variables
+    this._transactions[this._port._transactionIdWrite] = {
+        nextAddress: address,
+        nextCode: code,
+        lengthUnknown: true,
+        next: next
+    };
+    var codeLength = 5;
+    var buf = Buffer.alloc(codeLength + 2); // add 2 crc bytes
+    buf.writeUInt8(address, 0);
+    buf.writeUInt8(code, 1);
+    buf.writeUInt8(0x0E, 2); // 16 MEI Type
+    buf.writeUInt8(deviceIdCode, 3);
+    buf.writeUInt8(objectId, 4);
+    // add crc bytes to buffer
+    buf.writeUInt16LE(crc16(buf.slice(0, -2)), codeLength);
+    // write buffer to serial port
+    _writeBufferToPort.call(this, buf, this._port._transactionIdWrite);
+};
+
 // add the connection shorthand API
 require("./apis/connection")(ModbusRTU);
 
@@ -778,3 +858,4 @@ module.exports.TelnetPort = require("./ports/telnetport");
 module.exports.C701Port = require("./ports/c701port");
 
 module.exports.ServerTCP = require("./servers/servertcp");
+module.exports.default = module.exports;
